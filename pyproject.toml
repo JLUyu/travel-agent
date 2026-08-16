@@ -29,6 +29,12 @@ dev = [
     "pytest-timeout>=2.3.1",
 ]
 
+# The application is intentionally a flat collection of scripts.  Disable
+# setuptools' automatic package discovery so `pip install .` only installs
+# runtime dependencies; Docker executes the copied sources directly.
+[tool.setuptools]
+py-modules = []
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
