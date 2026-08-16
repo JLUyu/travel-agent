@@ -1,0 +1,23 @@
+{
+  "network": {
+    "allowedDomains": [
+      "wttr.in"
+    ],
+    "deniedDomains": [],
+    "allowLocalBinding": true
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh"
+    ],
+    "allowRead": [
+      "."
+    ],
+    "allowWrite": [
+      "~/.cache"
+    ],
+    "denyWrite": [
+      "./config.py"
+    ]
+  }
+}

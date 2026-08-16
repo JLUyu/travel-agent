@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+htmlcov
+memory
+node_modules
+.env
+.env.*
+!.env.example
+eval
+tests
+*.log
+.DS_Store

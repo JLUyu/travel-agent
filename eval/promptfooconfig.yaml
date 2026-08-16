@@ -1,0 +1,192 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+#
+# Travel Agent 评测配置（兼容 promptfoo eval --repeat n 多轮）
+# - 总分：仅由 LLM-as-judge 决定，rubric 内部两模块各 50%
+#     ① 工具调用链路执行顺序合理性（50%）
+#     ② 最终回答输出质量（50%）
+# - 单用例指标（promptfoo view 界面展示）：
+#     · llm_score（LLM-judge 评分）
+#     · tool_recall（工具召回率）
+# - 全局指标（通过 extensions/metrics.js 的 afterAll 钩子计算，输出到终端）：
+#     · avg_tool_recall（平均工具召回率）
+#     · latency_p50 / p95 / p99（延迟百分位数，毫秒）
+#     · avg_llm_score_variance（同一用例重复 n 次的 LLM 评分方差均值，需 --repeat n, n>=2）
+
+description: "Travel Agent eval - LLM-judge only, with observation metrics"
+
+evaluateOptions:
+  maxConcurrency: 10
+
+tracing:
+  enabled: true
+
+extensions:
+  - file://./extensions/metrics.js:afterAll
+
+prompts:
+  - "{{input}}"
+
+providers:
+  - id: file://./agent-provider.js
+    label: travel-agent
+    config:
+      endpoint: http://127.0.0.1:6008/chat/eval
+      timeoutMs: 600000
+      sessionPoolSize: 10
+      prewarmSessions: true
+
+defaultTest:
+  threshold: 0.6
+  options:
+    provider:
+      id: openai:chat:deepseek-v4-flash
+      label: deepseek-judge
+      config:
+        apiBaseUrl: https://api.deepseek.com
+        apiKey: ${DEEPSEEK_API_KEY}
+        temperature: 0
+
+  assert:
+    - type: javascript
+      metric: llm_score
+      weight: 1
+      value: |
+        const _self = this;
+        return (async () => {
+          const rubric = `你是严格的中文 Agent 评测裁判，请基于「标准答案」和「工具调用链路」评判 Agent 表现，两大模块各占 50%：
+
+        ① 工具调用链路执行顺序合理性（50%）：
+           - 结合用户问题判断实际调用的工具序列是否覆盖必要工具、顺序是否合理。
+           - 期望工具集合（仅供参考，允许合理增删换序）：__GOLDEN_TOOL_CALLS__
+           - 实际工具调用序列：__ACTUAL_TOOLS__
+
+        ② 最终回答输出质量（50%）：
+           - 以标准答案为参考评估准确性、完整性、是否存在拒答/乱码/答非所问。
+
+        每个模块打 0 / 0.6 / 1 三档：
+           0 分：严重缺失或错误、乱序、大量事实错误、无有效内容
+           0.6 分：基本可用但存在明显缺陷或部分偏差
+           1 分：完全合理 / 完全贴合标准答案
+
+        最终 score = 模块①得分 * 0.5 + 模块②得分 * 0.5，范围 0~1。
+
+        【用户问题】
+        __USER_QUERY__
+
+        【标准答案 golden_output】
+        __GOLDEN_OUTPUT__
+
+        【Agent 实际回答】
+        __OUTPUT__
+
+        必须严格按以下 JSON 输出，不要输出任何额外内容：
+        {"pass": true 或 false, "score": 0-1的小数, "reason": "中文简要说明，分别点评两个模块"}`;
+
+          let traj = [];
+          if (Array.isArray(_self.trajectory) && _self.trajectory.length > 0) {
+            traj = _self.trajectory;
+          } else {
+            const meta = (context.providerResponse && context.providerResponse.metadata) || {};
+            traj = Array.isArray(meta.tool_calls) ? meta.tool_calls : [];
+          }
+          const actualToolsStr = traj.map(String).join(' -> ') || '(无工具调用)';
+
+          const rendered = rubric
+            .replace(/__USER_QUERY__/g, String(context.vars.input || ''))
+            .replace(/__GOLDEN_OUTPUT__/g, String(context.vars.golden_output || ''))
+            .replace(/__GOLDEN_TOOL_CALLS__/g, String(context.vars.golden_tool_calls || ''))
+            .replace(/__OUTPUT__/g, String(output || ''))
+            .replace(/__ACTUAL_TOOLS__/g, actualToolsStr);
+
+          let judge;
+          try {
+            const r = await fetch('https://api.deepseek.com/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + process.env.DEEPSEEK_API_KEY,
+              },
+              body: JSON.stringify({
+                model: 'deepseek-v4-flash',
+                temperature: 0,
+                messages: [{ role: 'user', content: rendered }],
+              }),
+            });
+            const j = await r.json();
+            const txt = ((j.choices || [])[0] || {}).message
+              ? j.choices[0].message.content || ''
+              : '';
+            const m = txt.match(/\{[\s\S]*\}/);
+            if (!m) {
+              judge = { pass: false, score: 0, reason: 'judge 输出无法解析: ' + txt.slice(0, 200) };
+            } else {
+              try {
+                const obj = JSON.parse(m[0]);
+                const s = Math.max(0, Math.min(1, Number(obj.score) || 0));
+                judge = { pass: !!obj.pass, score: s, reason: String(obj.reason || '') };
+              } catch (e) {
+                judge = { pass: false, score: 0, reason: 'judge JSON 解析失败: ' + txt.slice(0, 200) };
+              }
+            }
+          } catch (e) {
+            judge = { pass: false, score: 0, reason: 'judge 请求异常: ' + (e && e.message ? e.message : String(e)) };
+          }
+
+          const parseList = (raw) => {
+            const s = String(raw || '').trim();
+            if (!s) return [];
+            // 新格式为 JSON 数组字符串，如 ["search","map"]
+            if (s.startsWith('[')) {
+              try {
+                const arr = JSON.parse(s);
+                if (Array.isArray(arr)) return arr.map(String);
+              } catch (e) {}
+            }
+            // 兼容旧格式：逗号/空白分隔
+            return s.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+          };
+
+          const expected = parseList(context.vars.golden_tool_calls);
+          let actualTools = [];
+          if (context.metadata && Array.isArray(context.metadata.tool_calls)) {
+            actualTools = context.metadata.tool_calls.map(String);
+          } else if (context.providerResponse && context.providerResponse.metadata && Array.isArray(context.providerResponse.metadata.tool_calls)) {
+            actualTools = context.providerResponse.metadata.tool_calls.map(String);
+          }
+
+          const actualCounts = actualTools.reduce((acc, name) => {
+            acc[name] = (acc[name] || 0) + 1;
+            return acc;
+          }, {});
+          let matched = 0;
+          for (const name of expected) {
+            if ((actualCounts[name] || 0) > 0) {
+              matched += 1;
+              actualCounts[name] -= 1;
+            }
+          }
+          const total = expected.length;
+          const toolRecall = total === 0 ? 1 : matched / total;
+
+          let latency = 0;
+          if (context.metadata && context.metadata.latencyMs !== undefined) {
+            latency = Number(context.metadata.latencyMs) / 1000;
+          } else if (context.providerResponse && context.providerResponse.metadata && context.providerResponse.metadata.latencyMs !== undefined) {
+            latency = Number(context.providerResponse.metadata.latencyMs) / 1000;
+          }
+
+          const totalCases = context.test && context.test.id ? 1 : 0;
+          const caseIdx = context.test && context.test.id ? String(context.test.id) : '';
+
+          return {
+            pass: judge.score >= 0.6,
+            score: judge.score,
+            reason: `[LLM-judge] score=${judge.score.toFixed(3)} | ${judge.reason}\n实际工具链路: ${actualToolsStr}`,
+            namedScores: {
+              llm_score: judge.score,
+              tool_recall: toolRecall,
+            }
+          };
+        })();
+
+tests: file://datasets/base_v1.csv
